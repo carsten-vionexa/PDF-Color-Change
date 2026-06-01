@@ -18,7 +18,7 @@ DEFAULT_INPUT_DIR = PROJECT_ROOT / "input"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "farbtabelle.json"
 DEFAULT_VECTOR_TOLERANCE = 30
-DEFAULT_IMAGE_TOLERANCE = 18
+DEFAULT_IMAGE_TOLERANCE = 35
 DEFAULT_IMAGE_PAGE_RANGE = "8-15"
 
 RGB_OPERATOR_RE = re.compile(
@@ -100,35 +100,38 @@ def recolour_content_stream(
     return RGB_OPERATOR_RE.sub(replace_match, content), dict(replacement_counts)
 
 
-def recolour_pil_image(
+def build_transparent_colour_overlay(
     image: Image.Image,
     colour_mapping: list[dict[str, Any]],
     tolerance: int,
 ) -> tuple[bytes, dict[str, int], dict[str, Any]]:
     rgba_image = image.convert("RGBA")
     width, height = rgba_image.size
-    raw = bytearray(rgba_image.tobytes())
+    source = rgba_image.tobytes()
+    overlay = bytearray(len(source))
     replacement_counts: dict[str, int] = defaultdict(int)
 
-    for index in range(0, len(raw), 4):
-        alpha = raw[index + 3]
+    for index in range(0, len(source), 4):
+        alpha = source[index + 3]
         if alpha == 0:
             continue
 
-        source_rgb = (raw[index], raw[index + 1], raw[index + 2])
+        source_rgb = (source[index], source[index + 1], source[index + 2])
         mapping = nearest_mapping(source_rgb, colour_mapping, tolerance)
         if mapping is None:
+            overlay[index + 3] = 0
             continue
 
         replacement = mapping["to_rgb"]
-        raw[index] = replacement[0]
-        raw[index + 1] = replacement[1]
-        raw[index + 2] = replacement[2]
+        overlay[index] = replacement[0]
+        overlay[index + 1] = replacement[1]
+        overlay[index + 2] = replacement[2]
+        overlay[index + 3] = alpha
         replacement_counts[mapping["label"]] += 1
 
-    recoloured = Image.frombytes("RGBA", (width, height), bytes(raw))
+    overlay_image = Image.frombytes("RGBA", (width, height), bytes(overlay))
     output = io.BytesIO()
-    recoloured.save(output, format="PNG")
+    overlay_image.save(output, format="PNG")
 
     return output.getvalue(), dict(replacement_counts), {
         "width": width,
@@ -220,7 +223,6 @@ def overlay_recoloured_images(
         page = document.load_page(page_index)
         for image_info in page.get_images(full=True):
             xref = image_info[0]
-            extension = ""
             key = (page_number, xref)
             if key in processed:
                 continue
@@ -232,7 +234,9 @@ def overlay_recoloured_images(
                 continue
 
             with Image.open(io.BytesIO(extracted["image"])) as image:
-                recoloured_bytes, counts, metadata = recolour_pil_image(image, colour_mapping, tolerance)
+                overlay_bytes, counts, metadata = build_transparent_colour_overlay(
+                    image, colour_mapping, tolerance
+                )
 
             if not counts:
                 continue
@@ -242,7 +246,7 @@ def overlay_recoloured_images(
                 continue
 
             for rect in rects:
-                page.insert_image(rect, stream=recoloured_bytes, overlay=True)
+                page.insert_image(rect, stream=overlay_bytes, overlay=True)
 
             image_result = {
                 "page_number": page_number,
@@ -281,7 +285,7 @@ def process_pdf(
     result = {
         "pdf": str(pdf_path),
         "output_pdf": str(output_path),
-        "mode": "preserve-text-vector-plus-image-overlay",
+        "mode": "preserve-text-vector-plus-transparent-image-overlay",
         "vector_tolerance": vector_tolerance,
         "image_tolerance": image_tolerance,
         "image_pages": "all" if image_pages is None else sorted(image_pages),
