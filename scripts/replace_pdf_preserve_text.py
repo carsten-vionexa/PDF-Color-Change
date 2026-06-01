@@ -18,8 +18,10 @@ DEFAULT_INPUT_DIR = PROJECT_ROOT / "input"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "farbtabelle.json"
 DEFAULT_VECTOR_TOLERANCE = 30
-DEFAULT_IMAGE_TOLERANCE = 35
+DEFAULT_IMAGE_TOLERANCE = 45
 DEFAULT_IMAGE_PAGE_RANGE = "8-15"
+DEFAULT_IMAGE_OVERLAY_MODE = "full"
+DEFAULT_MIN_IMAGE_DIMENSION = 50
 
 RGB_OPERATOR_RE = re.compile(
     rb"(?P<r>[+-]?(?:\d+\.\d+|\.\d+|\d+))\s+"
@@ -100,36 +102,53 @@ def recolour_content_stream(
     return RGB_OPERATOR_RE.sub(replace_match, content), dict(replacement_counts)
 
 
-def build_transparent_colour_overlay(
+def recolour_image_pixels(
     image: Image.Image,
     colour_mapping: list[dict[str, Any]],
     tolerance: int,
+    overlay_mode: str,
 ) -> tuple[bytes, dict[str, int], dict[str, Any]]:
     rgba_image = image.convert("RGBA")
     width, height = rgba_image.size
     source = rgba_image.tobytes()
-    overlay = bytearray(len(source))
+    output_pixels = bytearray(len(source))
     replacement_counts: dict[str, int] = defaultdict(int)
 
     for index in range(0, len(source), 4):
         alpha = source[index + 3]
-        if alpha == 0:
-            continue
-
         source_rgb = (source[index], source[index + 1], source[index + 2])
-        mapping = nearest_mapping(source_rgb, colour_mapping, tolerance)
-        if mapping is None:
-            overlay[index + 3] = 0
+        mapping = nearest_mapping(source_rgb, colour_mapping, tolerance) if alpha else None
+
+        if overlay_mode == "matched":
+            if mapping is None:
+                output_pixels[index + 3] = 0
+                continue
+            replacement = mapping["to_rgb"]
+            output_pixels[index] = replacement[0]
+            output_pixels[index + 1] = replacement[1]
+            output_pixels[index + 2] = replacement[2]
+            output_pixels[index + 3] = 255
+            replacement_counts[mapping["label"]] += 1
             continue
 
-        replacement = mapping["to_rgb"]
-        overlay[index] = replacement[0]
-        overlay[index + 1] = replacement[1]
-        overlay[index + 2] = replacement[2]
-        overlay[index + 3] = 255
-        replacement_counts[mapping["label"]] += 1
+        if overlay_mode == "full":
+            if mapping is None:
+                output_pixels[index] = source[index]
+                output_pixels[index + 1] = source[index + 1]
+                output_pixels[index + 2] = source[index + 2]
+                output_pixels[index + 3] = 255 if alpha else 0
+            else:
+                replacement = mapping["to_rgb"]
+                output_pixels[index] = replacement[0]
+                output_pixels[index + 1] = replacement[1]
+                output_pixels[index + 2] = replacement[2]
+                output_pixels[index + 3] = 255
+                replacement_counts[mapping["label"]] += 1
+            continue
 
-    overlay_image = Image.frombytes("RGBA", (width, height), bytes(overlay))
+        raise ValueError(f"Unsupported image overlay mode: {overlay_mode}")
+
+    overlay_image = Image.frombytes("RGBA", (width, height), bytes(output_pixels))
     output = io.BytesIO()
     overlay_image.save(output, format="PNG")
 
@@ -211,6 +230,8 @@ def overlay_recoloured_images(
     colour_mapping: list[dict[str, Any]],
     tolerance: int,
     image_pages: set[int] | None,
+    overlay_mode: str,
+    min_image_dimension: int,
 ) -> list[dict[str, Any]]:
     image_results: list[dict[str, Any]] = []
     processed: set[tuple[int, int]] = set()
@@ -234,8 +255,13 @@ def overlay_recoloured_images(
                 continue
 
             with Image.open(io.BytesIO(extracted["image"])) as image:
-                overlay_bytes, counts, metadata = build_transparent_colour_overlay(
-                    image, colour_mapping, tolerance
+                if min(image.size) < min_image_dimension:
+                    continue
+                overlay_bytes, counts, metadata = recolour_image_pixels(
+                    image=image,
+                    colour_mapping=colour_mapping,
+                    tolerance=tolerance,
+                    overlay_mode=overlay_mode,
                 )
 
             if not counts:
@@ -253,6 +279,7 @@ def overlay_recoloured_images(
                 "xref": xref,
                 "extension": extension,
                 "rect_count": len(rects),
+                "overlay_mode": overlay_mode,
                 "image_replacements": counts,
                 **metadata,
             }
@@ -270,6 +297,8 @@ def process_pdf(
     vector_tolerance: int,
     image_tolerance: int,
     image_pages: set[int] | None,
+    image_overlay_mode: str,
+    min_image_dimension: int,
 ) -> dict[str, Any]:
     document = fitz.open(pdf_path)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +306,14 @@ def process_pdf(
 
     print(f"PDF: {pdf_path}")
     vector_results = replace_vectors(document, colour_mapping, vector_tolerance)
-    image_results = overlay_recoloured_images(document, colour_mapping, image_tolerance, image_pages)
+    image_results = overlay_recoloured_images(
+        document=document,
+        colour_mapping=colour_mapping,
+        tolerance=image_tolerance,
+        image_pages=image_pages,
+        overlay_mode=image_overlay_mode,
+        min_image_dimension=min_image_dimension,
+    )
 
     document.save(output_path, garbage=4, deflate=True)
     document.close()
@@ -285,10 +321,12 @@ def process_pdf(
     result = {
         "pdf": str(pdf_path),
         "output_pdf": str(output_path),
-        "mode": "preserve-text-vector-plus-opaque-matched-image-overlay",
+        "mode": "preserve-text-vector-plus-image-overlay",
         "vector_tolerance": vector_tolerance,
         "image_tolerance": image_tolerance,
         "image_pages": "all" if image_pages is None else sorted(image_pages),
+        "image_overlay_mode": image_overlay_mode,
+        "min_image_dimension": min_image_dimension,
         "vector_pages": vector_results,
         "image_overlays": image_results,
     }
@@ -310,6 +348,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vector-tolerance", type=int, default=DEFAULT_VECTOR_TOLERANCE)
     parser.add_argument("--image-tolerance", type=int, default=DEFAULT_IMAGE_TOLERANCE)
     parser.add_argument("--image-pages", default=DEFAULT_IMAGE_PAGE_RANGE)
+    parser.add_argument(
+        "--image-overlay-mode",
+        choices=("full", "matched"),
+        default=DEFAULT_IMAGE_OVERLAY_MODE,
+    )
+    parser.add_argument("--min-image-dimension", type=int, default=DEFAULT_MIN_IMAGE_DIMENSION)
     return parser.parse_args()
 
 
@@ -331,6 +375,8 @@ def main() -> int:
             vector_tolerance=args.vector_tolerance,
             image_tolerance=args.image_tolerance,
             image_pages=image_pages,
+            image_overlay_mode=args.image_overlay_mode,
+            min_image_dimension=args.min_image_dimension,
         )
 
     return 0
