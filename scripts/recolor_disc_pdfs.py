@@ -17,9 +17,10 @@ DEFAULT_INPUT_DIR = PROJECT_ROOT / "input"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "farbtabelle.json"
 DEFAULT_TOLERANCE = 18
+DEFAULT_REPLACE_FORMATS = {"png"}
 
 
-def load_colour_mapping(config_path: Path) -> list[dict[str, str]]:
+def load_colour_mapping(config_path: Path) -> list[dict[str, Any]]:
     with config_path.open("r", encoding="utf-8") as file:
         data = json.load(file)
 
@@ -62,6 +63,27 @@ def analysis_log_path(pdf_path: Path, output_dir: Path) -> Path:
     return output_dir / f"{pdf_path.stem}_analysis_log.json"
 
 
+def replacement_log_path(pdf_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{pdf_path.stem}_replacement_log.json"
+
+
+def nearest_mapping(
+    pixel: tuple[int, int, int],
+    colour_mapping: list[dict[str, Any]],
+    tolerance: int,
+) -> dict[str, Any] | None:
+    best_mapping: dict[str, Any] | None = None
+    best_distance: float | None = None
+
+    for mapping in colour_mapping:
+        distance = rgb_distance(pixel, mapping["from_rgb"])
+        if distance <= tolerance and (best_distance is None or distance < best_distance):
+            best_mapping = mapping
+            best_distance = distance
+
+    return best_mapping
+
+
 def count_colour_matches(
     image_bytes: bytes,
     colour_mapping: list[dict[str, Any]],
@@ -70,13 +92,14 @@ def count_colour_matches(
     with Image.open(io.BytesIO(image_bytes)) as image:
         rgb_image = image.convert("RGB")
         width, height = rgb_image.size
-        pixels = rgb_image.getdata()
+        raw = rgb_image.tobytes()
 
         match_counts: dict[str, int] = defaultdict(int)
-        for pixel in pixels:
-            for mapping in colour_mapping:
-                if rgb_distance(pixel, mapping["from_rgb"]) <= tolerance:
-                    match_counts[mapping["label"]] += 1
+        for index in range(0, len(raw), 3):
+            pixel = (raw[index], raw[index + 1], raw[index + 2])
+            mapping = nearest_mapping(pixel, colour_mapping, tolerance)
+            if mapping is not None:
+                match_counts[mapping["label"]] += 1
 
         metadata = {
             "width": width,
@@ -87,6 +110,48 @@ def count_colour_matches(
         }
 
     return dict(match_counts), metadata
+
+
+def recolour_image(
+    image_bytes: bytes,
+    colour_mapping: list[dict[str, Any]],
+    tolerance: int,
+) -> tuple[bytes, dict[str, int], dict[str, Any]]:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        rgba_image = image.convert("RGBA")
+        width, height = rgba_image.size
+        raw = bytearray(rgba_image.tobytes())
+        replacement_counts: dict[str, int] = defaultdict(int)
+
+        for index in range(0, len(raw), 4):
+            alpha = raw[index + 3]
+            if alpha == 0:
+                continue
+
+            pixel = (raw[index], raw[index + 1], raw[index + 2])
+            mapping = nearest_mapping(pixel, colour_mapping, tolerance)
+            if mapping is None:
+                continue
+
+            replacement = mapping["to_rgb"]
+            raw[index] = replacement[0]
+            raw[index + 1] = replacement[1]
+            raw[index + 2] = replacement[2]
+            replacement_counts[mapping["label"]] += 1
+
+        recoloured = Image.frombytes("RGBA", (width, height), bytes(raw))
+        output = io.BytesIO()
+        recoloured.save(output, format="PNG")
+
+        metadata = {
+            "width": width,
+            "height": height,
+            "mode": image.mode,
+            "format": image.format,
+            "pixel_count": width * height,
+        }
+
+    return output.getvalue(), dict(replacement_counts), metadata
 
 
 def analyse_pdf(
@@ -160,7 +225,126 @@ def analyse_pdf(
     return result
 
 
-def run(input_dir: Path, output_dir: Path, config_path: Path, analyze: bool, tolerance: int) -> int:
+def replace_pdf_colours(
+    pdf_path: Path,
+    output_dir: Path,
+    colour_mapping: list[dict[str, Any]],
+    tolerance: int,
+    replace_formats: set[str],
+) -> dict[str, Any]:
+    document = fitz.open(pdf_path)
+    output_path = planned_output_path(pdf_path, output_dir)
+    result: dict[str, Any] = {
+        "pdf": str(pdf_path),
+        "output_pdf": str(output_path),
+        "page_count": document.page_count,
+        "tolerance": tolerance,
+        "replace_formats": sorted(replace_formats),
+        "replaced_images": [],
+        "skipped_images": [],
+    }
+
+    processed_xrefs: set[int] = set()
+    pages_by_xref: dict[int, set[int]] = defaultdict(set)
+
+    for page_index in range(document.page_count):
+        page = document.load_page(page_index)
+        for image_info in page.get_images(full=True):
+            pages_by_xref[image_info[0]].add(page_index + 1)
+
+    print(f"PDF: {pdf_path}")
+    print(f"Pages: {document.page_count}")
+
+    for page_index in range(document.page_count):
+        page = document.load_page(page_index)
+        images = page.get_images(full=True)
+
+        for image_index, image_info in enumerate(images, start=1):
+            xref = image_info[0]
+            if xref in processed_xrefs:
+                continue
+            processed_xrefs.add(xref)
+
+            extracted = document.extract_image(xref)
+            extension = str(extracted.get("ext", "")).lower()
+
+            if extension not in replace_formats:
+                result["skipped_images"].append(
+                    {
+                        "xref": xref,
+                        "extension": extension,
+                        "pages": sorted(pages_by_xref[xref]),
+                        "reason": "format not selected for replacement",
+                    }
+                )
+                continue
+
+            image_bytes = extracted["image"]
+            recoloured_bytes, replacement_counts, image_metadata = recolour_image(
+                image_bytes=image_bytes,
+                colour_mapping=colour_mapping,
+                tolerance=tolerance,
+            )
+
+            if not replacement_counts:
+                result["skipped_images"].append(
+                    {
+                        "xref": xref,
+                        "extension": extension,
+                        "pages": sorted(pages_by_xref[xref]),
+                        "reason": "no colour matches",
+                        **image_metadata,
+                    }
+                )
+                continue
+
+            page.replace_image(xref, stream=recoloured_bytes)
+            replaced_image = {
+                "xref": xref,
+                "extension": extension,
+                "pages": sorted(pages_by_xref[xref]),
+                **image_metadata,
+                "replacements": replacement_counts,
+            }
+            result["replaced_images"].append(replaced_image)
+
+            replacement_summary = ", ".join(
+                f"{label}: {count}" for label, count in sorted(replacement_counts.items())
+            )
+            print(
+                f"Replaced xref {xref} on page(s) {sorted(pages_by_xref[xref])}: "
+                f"{replacement_summary}"
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document.save(output_path, garbage=4, deflate=True)
+    document.close()
+
+    log_path = replacement_log_path(pdf_path, output_dir)
+    with log_path.open("w", encoding="utf-8") as file:
+        json.dump(result, file, indent=2, ensure_ascii=False)
+
+    print(f"Output PDF: {output_path}")
+    print(f"Replacement log: {log_path}")
+    return result
+
+
+def parse_replace_formats(value: str) -> set[str]:
+    formats = {item.strip().lower().lstrip(".") for item in value.split(",") if item.strip()}
+    if not formats:
+        raise ValueError("At least one replacement image format must be provided.")
+    return formats
+
+
+def run(
+    input_dir: Path,
+    output_dir: Path,
+    config_path: Path,
+    analyze: bool,
+    replace: bool,
+    tolerance: int,
+    replace_formats: set[str],
+) -> int:
     colour_mapping = load_colour_mapping(config_path)
     pdf_files = find_pdf_files(input_dir)
 
@@ -175,6 +359,8 @@ def run(input_dir: Path, output_dir: Path, config_path: Path, analyze: bool, tol
     for pdf_path in pdf_files:
         if analyze:
             analyse_pdf(pdf_path, output_dir, colour_mapping, tolerance)
+        elif replace:
+            replace_pdf_colours(pdf_path, output_dir, colour_mapping, tolerance, replace_formats)
         else:
             print(f"Found PDF: {pdf_path}")
             print(f"Planned output: {planned_output_path(pdf_path, output_dir)}")
@@ -188,13 +374,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--analyze", action="store_true", help="Analyse embedded images and colour matches.")
-    parser.add_argument("--tolerance", type=int, default=DEFAULT_TOLERANCE, help="RGB distance tolerance for colour matching.")
-    return parser.parse_args()
+    parser.add_argument("--replace", action="store_true", help="Replace colours in selected embedded image formats.")
+    parser.add_argument(
+        "--replace-formats",
+        type=parse_replace_formats,
+        default=DEFAULT_REPLACE_FORMATS,
+        help="Comma-separated image formats to replace. Default: png",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=int,
+        default=DEFAULT_TOLERANCE,
+        help="RGB distance tolerance for colour matching.",
+    )
+    args = parser.parse_args()
+
+    if args.analyze and args.replace:
+        parser.error("Use either --analyze or --replace, not both.")
+
+    return args
 
 
 def main() -> int:
     args = parse_args()
-    return run(args.input_dir, args.output_dir, args.config, args.analyze, args.tolerance)
+    return run(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        config_path=args.config,
+        analyze=args.analyze,
+        replace=args.replace,
+        tolerance=args.tolerance,
+        replace_formats=args.replace_formats,
+    )
 
 
 if __name__ == "__main__":
