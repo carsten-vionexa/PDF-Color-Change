@@ -18,6 +18,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "farbtabelle.json"
 DEFAULT_TOLERANCE = 18
 DEFAULT_REPLACE_FORMATS = {"png"}
+DEFAULT_RENDER_DPI = 180
 
 
 def load_colour_mapping(config_path: Path) -> list[dict[str, Any]]:
@@ -112,34 +113,43 @@ def count_colour_matches(
     return dict(match_counts), metadata
 
 
+def recolour_pil_image(
+    image: Image.Image,
+    colour_mapping: list[dict[str, Any]],
+    tolerance: int,
+) -> tuple[Image.Image, dict[str, int]]:
+    rgba_image = image.convert("RGBA")
+    width, height = rgba_image.size
+    raw = bytearray(rgba_image.tobytes())
+    replacement_counts: dict[str, int] = defaultdict(int)
+
+    for index in range(0, len(raw), 4):
+        alpha = raw[index + 3]
+        if alpha == 0:
+            continue
+
+        pixel = (raw[index], raw[index + 1], raw[index + 2])
+        mapping = nearest_mapping(pixel, colour_mapping, tolerance)
+        if mapping is None:
+            continue
+
+        replacement = mapping["to_rgb"]
+        raw[index] = replacement[0]
+        raw[index + 1] = replacement[1]
+        raw[index + 2] = replacement[2]
+        replacement_counts[mapping["label"]] += 1
+
+    return Image.frombytes("RGBA", (width, height), bytes(raw)), dict(replacement_counts)
+
+
 def recolour_image(
     image_bytes: bytes,
     colour_mapping: list[dict[str, Any]],
     tolerance: int,
 ) -> tuple[bytes, dict[str, int], dict[str, Any]]:
     with Image.open(io.BytesIO(image_bytes)) as image:
-        rgba_image = image.convert("RGBA")
-        width, height = rgba_image.size
-        raw = bytearray(rgba_image.tobytes())
-        replacement_counts: dict[str, int] = defaultdict(int)
-
-        for index in range(0, len(raw), 4):
-            alpha = raw[index + 3]
-            if alpha == 0:
-                continue
-
-            pixel = (raw[index], raw[index + 1], raw[index + 2])
-            mapping = nearest_mapping(pixel, colour_mapping, tolerance)
-            if mapping is None:
-                continue
-
-            replacement = mapping["to_rgb"]
-            raw[index] = replacement[0]
-            raw[index + 1] = replacement[1]
-            raw[index + 2] = replacement[2]
-            replacement_counts[mapping["label"]] += 1
-
-        recoloured = Image.frombytes("RGBA", (width, height), bytes(raw))
+        width, height = image.size
+        recoloured, replacement_counts = recolour_pil_image(image, colour_mapping, tolerance)
         output = io.BytesIO()
         recoloured.save(output, format="PNG")
 
@@ -151,7 +161,7 @@ def recolour_image(
             "pixel_count": width * height,
         }
 
-    return output.getvalue(), dict(replacement_counts), metadata
+    return output.getvalue(), replacement_counts, metadata
 
 
 def analyse_pdf(
@@ -186,11 +196,7 @@ def analyse_pdf(
             xref = image_info[0]
             extracted = document.extract_image(xref)
             image_bytes = extracted["image"]
-            match_counts, image_metadata = count_colour_matches(
-                image_bytes=image_bytes,
-                colour_mapping=colour_mapping,
-                tolerance=tolerance,
-            )
+            match_counts, image_metadata = count_colour_matches(image_bytes, colour_mapping, tolerance)
             image_result = {
                 "image_number": image_index,
                 "xref": xref,
@@ -225,7 +231,7 @@ def analyse_pdf(
     return result
 
 
-def replace_pdf_colours(
+def replace_pdf_image_objects(
     pdf_path: Path,
     output_dir: Path,
     colour_mapping: list[dict[str, Any]],
@@ -237,6 +243,7 @@ def replace_pdf_colours(
     result: dict[str, Any] = {
         "pdf": str(pdf_path),
         "output_pdf": str(output_path),
+        "mode": "image-objects",
         "page_count": document.page_count,
         "tolerance": tolerance,
         "replace_formats": sorted(replace_formats),
@@ -259,7 +266,7 @@ def replace_pdf_colours(
         page = document.load_page(page_index)
         images = page.get_images(full=True)
 
-        for image_index, image_info in enumerate(images, start=1):
+        for image_info in images:
             xref = image_info[0]
             if xref in processed_xrefs:
                 continue
@@ -281,9 +288,7 @@ def replace_pdf_colours(
 
             image_bytes = extracted["image"]
             recoloured_bytes, replacement_counts, image_metadata = recolour_image(
-                image_bytes=image_bytes,
-                colour_mapping=colour_mapping,
-                tolerance=tolerance,
+                image_bytes, colour_mapping, tolerance
             )
 
             if not replacement_counts:
@@ -307,7 +312,6 @@ def replace_pdf_colours(
                 "replacements": replacement_counts,
             }
             result["replaced_images"].append(replaced_image)
-
             replacement_summary = ", ".join(
                 f"{label}: {count}" for label, count in sorted(replacement_counts.items())
             )
@@ -319,6 +323,80 @@ def replace_pdf_colours(
     output_dir.mkdir(parents=True, exist_ok=True)
     document.save(output_path, garbage=4, deflate=True)
     document.close()
+
+    log_path = replacement_log_path(pdf_path, output_dir)
+    with log_path.open("w", encoding="utf-8") as file:
+        json.dump(result, file, indent=2, ensure_ascii=False)
+
+    print(f"Output PDF: {output_path}")
+    print(f"Replacement log: {log_path}")
+    return result
+
+
+def render_page_to_image(page: fitz.Page, dpi: int) -> Image.Image:
+    matrix = fitz.Matrix(dpi / 72, dpi / 72)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+    return Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGBA")
+
+
+def replace_pdf_rendered_pages(
+    pdf_path: Path,
+    output_dir: Path,
+    colour_mapping: list[dict[str, Any]],
+    tolerance: int,
+    render_dpi: int,
+) -> dict[str, Any]:
+    source_document = fitz.open(pdf_path)
+    output_document = fitz.open()
+    output_path = planned_output_path(pdf_path, output_dir)
+    result: dict[str, Any] = {
+        "pdf": str(pdf_path),
+        "output_pdf": str(output_path),
+        "mode": "rendered-pages",
+        "page_count": source_document.page_count,
+        "tolerance": tolerance,
+        "render_dpi": render_dpi,
+        "pages": [],
+    }
+
+    print(f"PDF: {pdf_path}")
+    print(f"Pages: {source_document.page_count}")
+    print(f"Replacement mode: rendered-pages at {render_dpi} dpi")
+
+    for page_index in range(source_document.page_count):
+        source_page = source_document.load_page(page_index)
+        rendered = render_page_to_image(source_page, render_dpi)
+        recoloured, replacement_counts = recolour_pil_image(rendered, colour_mapping, tolerance)
+
+        image_output = io.BytesIO()
+        recoloured.convert("RGB").save(image_output, format="JPEG", quality=95)
+        image_bytes = image_output.getvalue()
+
+        page_rect = source_page.rect
+        output_page = output_document.new_page(width=page_rect.width, height=page_rect.height)
+        output_page.insert_image(page_rect, stream=image_bytes)
+
+        page_result = {
+            "page_number": page_index + 1,
+            "width": rendered.width,
+            "height": rendered.height,
+            "pixel_count": rendered.width * rendered.height,
+            "replacements": replacement_counts,
+        }
+        result["pages"].append(page_result)
+
+        if replacement_counts:
+            replacement_summary = ", ".join(
+                f"{label}: {count}" for label, count in sorted(replacement_counts.items())
+            )
+        else:
+            replacement_summary = "no colour matches"
+        print(f"Page {page_index + 1}: {replacement_summary}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_document.save(output_path, garbage=4, deflate=True)
+    output_document.close()
+    source_document.close()
 
     log_path = replacement_log_path(pdf_path, output_dir)
     with log_path.open("w", encoding="utf-8") as file:
@@ -344,6 +422,8 @@ def run(
     replace: bool,
     tolerance: int,
     replace_formats: set[str],
+    replace_mode: str,
+    render_dpi: int,
 ) -> int:
     colour_mapping = load_colour_mapping(config_path)
     pdf_files = find_pdf_files(input_dir)
@@ -360,7 +440,12 @@ def run(
         if analyze:
             analyse_pdf(pdf_path, output_dir, colour_mapping, tolerance)
         elif replace:
-            replace_pdf_colours(pdf_path, output_dir, colour_mapping, tolerance, replace_formats)
+            if replace_mode == "image-objects":
+                replace_pdf_image_objects(pdf_path, output_dir, colour_mapping, tolerance, replace_formats)
+            elif replace_mode == "rendered-pages":
+                replace_pdf_rendered_pages(pdf_path, output_dir, colour_mapping, tolerance, render_dpi)
+            else:
+                raise ValueError(f"Unsupported replacement mode: {replace_mode}")
         else:
             print(f"Found PDF: {pdf_path}")
             print(f"Planned output: {planned_output_path(pdf_path, output_dir)}")
@@ -374,12 +459,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--analyze", action="store_true", help="Analyse embedded images and colour matches.")
-    parser.add_argument("--replace", action="store_true", help="Replace colours in selected embedded image formats.")
+    parser.add_argument("--replace", action="store_true", help="Replace colours and write recoloured PDFs.")
+    parser.add_argument(
+        "--replace-mode",
+        choices=("rendered-pages", "image-objects"),
+        default="rendered-pages",
+        help="Replacement mode. Default: rendered-pages for reliable visual output.",
+    )
     parser.add_argument(
         "--replace-formats",
         type=parse_replace_formats,
         default=DEFAULT_REPLACE_FORMATS,
-        help="Comma-separated image formats to replace. Default: png",
+        help="Comma-separated image formats for image-objects mode. Default: png",
+    )
+    parser.add_argument(
+        "--render-dpi",
+        type=int,
+        default=DEFAULT_RENDER_DPI,
+        help="DPI for rendered-pages mode. Default: 180",
     )
     parser.add_argument(
         "--tolerance",
@@ -405,6 +502,8 @@ def main() -> int:
         replace=args.replace,
         tolerance=args.tolerance,
         replace_formats=args.replace_formats,
+        replace_mode=args.replace_mode,
+        render_dpi=args.render_dpi,
     )
 
 
