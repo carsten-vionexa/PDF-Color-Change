@@ -1,0 +1,42 @@
+[
+  {
+    "label": "D hell",
+    "from": "#c3e3ca",
+    "to": "#fccdc0"
+  },
+  {
+    "label": "D kraeftig",
+    "from": "#8acc9c",
+    "to": "#f79f8e"
+  },
+  {
+    "label": "i hell",
+    "from": "#fccdc0",
+    "to": "#ffe6b0"
+  },
+  {
+    "label": "i kraeftig",
+    "from": "#f79f8e",
+    "to": "#ffd167"
+  },
+  {
+    "label": "G hell",
+    "from": "#ffe6b0",
+    "to": "#b6d9ee"
+  },
+  {
+    "label": "G kraeftig",
+    "from": "#ffd167",
+    "to": "#6dbce3"
+  },
+  {
+    "label": "S hell",
+    "from": "#b6d9ee",
+    "to": "#c3e3ca"
+  },
+  {
+    "label": "S kraeftig",
+    "from": "#6dbce3",
+    "to": "#8acc9c"
+  }
+]
