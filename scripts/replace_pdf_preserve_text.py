@@ -21,6 +21,7 @@ DEFAULT_VECTOR_TOLERANCE = 30
 DEFAULT_IMAGE_TOLERANCE = 45
 DEFAULT_IMAGE_PAGE_RANGE = "8-15"
 DEFAULT_IMAGE_OVERLAY_MODE = "full"
+DEFAULT_IMAGE_OPERATION = "replace"
 DEFAULT_MIN_IMAGE_DIMENSION = 50
 
 RGB_OPERATOR_RE = re.compile(
@@ -136,13 +137,13 @@ def recolour_image_pixels(
                 output_pixels[index] = source[index]
                 output_pixels[index + 1] = source[index + 1]
                 output_pixels[index + 2] = source[index + 2]
-                output_pixels[index + 3] = 255 if alpha else 0
+                output_pixels[index + 3] = alpha
             else:
                 replacement = mapping["to_rgb"]
                 output_pixels[index] = replacement[0]
                 output_pixels[index + 1] = replacement[1]
                 output_pixels[index + 2] = replacement[2]
-                output_pixels[index + 3] = 255
+                output_pixels[index + 3] = alpha
                 replacement_counts[mapping["label"]] += 1
             continue
 
@@ -225,16 +226,27 @@ def replace_vectors(document: fitz.Document, colour_mapping: list[dict[str, Any]
     return page_results
 
 
-def overlay_recoloured_images(
+def collect_pages_by_xref(document: fitz.Document) -> dict[int, set[int]]:
+    pages_by_xref: dict[int, set[int]] = defaultdict(set)
+    for page_index in range(document.page_count):
+        page = document.load_page(page_index)
+        for image_info in page.get_images(full=True):
+            pages_by_xref[image_info[0]].add(page_index + 1)
+    return pages_by_xref
+
+
+def modify_recoloured_images(
     document: fitz.Document,
     colour_mapping: list[dict[str, Any]],
     tolerance: int,
     image_pages: set[int] | None,
     overlay_mode: str,
+    operation: str,
     min_image_dimension: int,
 ) -> list[dict[str, Any]]:
     image_results: list[dict[str, Any]] = []
-    processed: set[tuple[int, int]] = set()
+    processed_xrefs: set[int] = set()
+    pages_by_xref = collect_pages_by_xref(document)
 
     for page_index in range(document.page_count):
         page_number = page_index + 1
@@ -244,10 +256,12 @@ def overlay_recoloured_images(
         page = document.load_page(page_index)
         for image_info in page.get_images(full=True):
             xref = image_info[0]
-            key = (page_number, xref)
-            if key in processed:
+            if xref in processed_xrefs:
                 continue
-            processed.add(key)
+
+            affected_pages = pages_by_xref.get(xref, set())
+            if image_pages is not None and not affected_pages.intersection(image_pages):
+                continue
 
             extracted = document.extract_image(xref)
             extension = str(extracted.get("ext", "")).lower()
@@ -257,7 +271,7 @@ def overlay_recoloured_images(
             with Image.open(io.BytesIO(extracted["image"])) as image:
                 if min(image.size) < min_image_dimension:
                     continue
-                overlay_bytes, counts, metadata = recolour_image_pixels(
+                modified_bytes, counts, metadata = recolour_image_pixels(
                     image=image,
                     colour_mapping=colour_mapping,
                     tolerance=tolerance,
@@ -267,25 +281,34 @@ def overlay_recoloured_images(
             if not counts:
                 continue
 
-            rects = page.get_image_rects(xref)
-            if not rects:
-                continue
-
-            for rect in rects:
-                page.insert_image(rect, stream=overlay_bytes, overlay=True)
+            if operation == "replace":
+                page.replace_image(xref, stream=modified_bytes)
+                processed_xrefs.add(xref)
+                rect_count = sum(len(document.load_page(page_no - 1).get_image_rects(xref)) for page_no in affected_pages)
+            elif operation == "overlay":
+                rects = page.get_image_rects(xref)
+                if not rects:
+                    continue
+                for rect in rects:
+                    page.insert_image(rect, stream=modified_bytes, overlay=True)
+                processed_xrefs.add(xref)
+                rect_count = len(rects)
+            else:
+                raise ValueError(f"Unsupported image operation: {operation}")
 
             image_result = {
-                "page_number": page_number,
                 "xref": xref,
                 "extension": extension,
-                "rect_count": len(rects),
+                "pages": sorted(affected_pages),
+                "rect_count": rect_count,
+                "operation": operation,
                 "overlay_mode": overlay_mode,
                 "image_replacements": counts,
                 **metadata,
             }
             image_results.append(image_result)
             summary = ", ".join(f"{label}: {count}" for label, count in sorted(counts.items()))
-            print(f"Page {page_number} image xref {xref}: {summary}")
+            print(f"Image xref {xref} page(s) {sorted(affected_pages)}: {summary}")
 
     return image_results
 
@@ -298,6 +321,7 @@ def process_pdf(
     image_tolerance: int,
     image_pages: set[int] | None,
     image_overlay_mode: str,
+    image_operation: str,
     min_image_dimension: int,
 ) -> dict[str, Any]:
     document = fitz.open(pdf_path)
@@ -306,12 +330,13 @@ def process_pdf(
 
     print(f"PDF: {pdf_path}")
     vector_results = replace_vectors(document, colour_mapping, vector_tolerance)
-    image_results = overlay_recoloured_images(
+    image_results = modify_recoloured_images(
         document=document,
         colour_mapping=colour_mapping,
         tolerance=image_tolerance,
         image_pages=image_pages,
         overlay_mode=image_overlay_mode,
+        operation=image_operation,
         min_image_dimension=min_image_dimension,
     )
 
@@ -321,14 +346,15 @@ def process_pdf(
     result = {
         "pdf": str(pdf_path),
         "output_pdf": str(output_path),
-        "mode": "preserve-text-vector-plus-image-overlay",
+        "mode": "preserve-text-vector-plus-image-object-replacement",
         "vector_tolerance": vector_tolerance,
         "image_tolerance": image_tolerance,
         "image_pages": "all" if image_pages is None else sorted(image_pages),
         "image_overlay_mode": image_overlay_mode,
+        "image_operation": image_operation,
         "min_image_dimension": min_image_dimension,
         "vector_pages": vector_results,
-        "image_overlays": image_results,
+        "image_modifications": image_results,
     }
 
     log_path = output_log_path(pdf_path, output_dir)
@@ -353,6 +379,11 @@ def parse_args() -> argparse.Namespace:
         choices=("full", "matched"),
         default=DEFAULT_IMAGE_OVERLAY_MODE,
     )
+    parser.add_argument(
+        "--image-operation",
+        choices=("replace", "overlay"),
+        default=DEFAULT_IMAGE_OPERATION,
+    )
     parser.add_argument("--min-image-dimension", type=int, default=DEFAULT_MIN_IMAGE_DIMENSION)
     return parser.parse_args()
 
@@ -376,6 +407,7 @@ def main() -> int:
             image_tolerance=args.image_tolerance,
             image_pages=image_pages,
             image_overlay_mode=args.image_overlay_mode,
+            image_operation=args.image_operation,
             min_image_dimension=args.min_image_dimension,
         )
 
