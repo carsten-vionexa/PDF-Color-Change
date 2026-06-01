@@ -126,7 +126,7 @@ def build_transparent_colour_overlay(
         overlay[index] = replacement[0]
         overlay[index + 1] = replacement[1]
         overlay[index + 2] = replacement[2]
-        overlay[index + 3] = alpha
+        overlay[index + 3] = 255
         replacement_counts[mapping["label"]] += 1
 
     overlay_image = Image.frombytes("RGBA", (width, height), bytes(overlay))
@@ -285,7 +285,7 @@ def process_pdf(
     result = {
         "pdf": str(pdf_path),
         "output_pdf": str(output_path),
-        "mode": "preserve-text-vector-plus-transparent-image-overlay",
+        "mode": "preserve-text-vector-plus-opaque-matched-image-overlay",
         "vector_tolerance": vector_tolerance,
         "image_tolerance": image_tolerance,
         "image_pages": "all" if image_pages is None else sorted(image_pages),
