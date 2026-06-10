@@ -38,5 +38,50 @@
     "label": "S kraeftig",
     "from": "#6dbce3",
     "to": "#8acc9c"
+  },
+  {
+    "label": "D kraeftig zusatz 1",
+    "from": "#00ae42",
+    "to": "#f79f8e"
+  },
+  {
+    "label": "D hell zusatz 1",
+    "from": "#91daae",
+    "to": "#fccdc0"
+  },
+  {
+    "label": "D mittel zusatz 1",
+    "from": "#0ead4b",
+    "to": "#f9b8aa"
+  },
+  {
+    "label": "i kraeftig zusatz 1",
+    "from": "#ce3841",
+    "to": "#ffd167"
+  },
+  {
+    "label": "i kraeftig zusatz 2",
+    "from": "#cd3741",
+    "to": "#ffdc8a"
+  },
+  {
+    "label": "S kraeftig zusatz 1",
+    "from": "#0099c5",
+    "to": "#8acc9c"
+  },
+  {
+    "label": "S hell zusatz 1",
+    "from": "#00a1d1",
+    "to": "#c3e3ca"
+  },
+  {
+    "label": "G kraeftig zusatz 1",
+    "from": "#f3cc23",
+    "to": "#6dbce3"
+  },
+  {
+    "label": "G mittel zusatz 1",
+    "from": "#f5cd27",
+    "to": "#90cce8"
   }
 ]
