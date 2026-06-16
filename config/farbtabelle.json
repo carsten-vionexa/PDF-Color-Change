@@ -83,5 +83,20 @@
     "label": "G mittel zusatz 1",
     "from": "#f5cd27",
     "to": "#90cce8"
+  },
+  {
+    "label": "G hell zusatz 2 Josep",
+    "from": "#fcf3cb",
+    "to": "#b6d9ee"
+  },
+  {
+    "label": "S kraeftig zusatz 2 Josep",
+    "from": "#35ade3",
+    "to": "#8acc9c"
+  },
+  {
+    "label": "G kraeftig zusatz 2 Josep",
+    "from": "#fcd604",
+    "to": "#6dbce3"
   }
 ]
